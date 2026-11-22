@@ -65,8 +65,8 @@ def info(url: str):
         raise HTTPException(400, "Link thik chaina")
     try:
         d = extract(url)
-    except Exception:
-        raise HTTPException(400, "Yo link bata video paiyena")
+    except Exception as e:
+        raise HTTPException(400, f"Error: {str(e)[:300]}")
     heights = sorted({f["height"] for f in d.get("formats", [])
                       if direct(f) and has_v(f) and has_a(f) and f.get("height")})
     return {"title": d.get("title"), "thumbnail": d.get("thumbnail"), "heights": heights}
@@ -77,8 +77,8 @@ async def download(url: str, quality: str = "best"):
         raise HTTPException(400, "Link thik chaina")
     try:
         d = await run_in_threadpool(extract, url)
-    except Exception:
-        raise HTTPException(400, "Yo link bata video paiyena")
+    except Exception as e:
+        raise HTTPException(400, f"Error: {str(e)[:300]}")
     f = pick_format(d, quality)
     if not f:
         raise HTTPException(404, "Download garne format paiyena")
