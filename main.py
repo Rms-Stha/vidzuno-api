@@ -1,4 +1,4 @@
-import ipaddress, socket
+import ipaddress, logging, socket
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -7,6 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("vidzuno")
 
 app = FastAPI()
 app.add_middleware(
@@ -17,7 +20,7 @@ app.add_middleware(
 )
 
 def safe_url(u: str) -> bool:
-    """localhost / private IP ko link block garcha (server ko security)"""
+    """Blocks localhost / private IP links (server security)"""
     p = urlparse(u)
     if p.scheme not in ("http", "https") or not p.hostname:
         return False
@@ -30,8 +33,38 @@ def safe_url(u: str) -> bool:
         return False
     return True
 
+def friendly(err: str) -> str:
+    e = err.lower()
+    if "not a bot" in e:
+        return "The source site blocked our server (bot check). Please try again later or use another link."
+    if "drm" in e:
+        return "This video is DRM-protected and cannot be downloaded."
+    if "unsupported url" in e:
+        return "This website is not supported yet."
+    if any(k in e for k in ("private", "login", "log in", "sign in", "members", "age-restricted", "cookies")):
+        return "This video is private or requires login."
+    if any(k in e for k in ("country", "geo", "region")):
+        return "This video is not available in our server's region."
+    if any(k in e for k in ("404", "not found", "removed", "unavailable", "does not exist")):
+        return "Video not found or it has been removed."
+    if any(k in e for k in ("429", "403", "forbidden", "too many requests")):
+        return "The source site blocked the request. Please try again later."
+    return "Could not fetch this video. Please check the link and try again."
+
+def fail(e: Exception):
+    raw = str(e)
+    log.warning("extract failed: %s", raw)
+    # "debug" testing ko lagi matra; site live garne bela yo line hataau
+    raise HTTPException(400, {"message": friendly(raw), "debug": raw[:300]})
+
 def extract(url: str):
-    opts = {"quiet": True, "noplaylist": True, "skip_download": True}
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+        "retries": 2,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -53,7 +86,7 @@ def pick_format(d, quality: str):
         return None
     want = int(quality) if quality.isdigit() else 0
     exact = [f for f in vids if f.get("height") == want]
-    return exact[-1] if exact else vids[-1]   # nabhaye original (sabai bhanda thulo)
+    return exact[-1] if exact else vids[-1]   # default: highest quality
 
 @app.get("/")
 def health():
@@ -62,11 +95,11 @@ def health():
 @app.get("/api/info")
 def info(url: str):
     if not safe_url(url):
-        raise HTTPException(400, "Link thik chaina")
+        raise HTTPException(400, {"message": "Invalid link."})
     try:
         d = extract(url)
     except Exception as e:
-        raise HTTPException(400, f"Error: {str(e)[:300]}")
+        fail(e)
     heights = sorted({f["height"] for f in d.get("formats", [])
                       if direct(f) and has_v(f) and has_a(f) and f.get("height")})
     return {"title": d.get("title"), "thumbnail": d.get("thumbnail"), "heights": heights}
@@ -74,14 +107,14 @@ def info(url: str):
 @app.get("/api/download")
 async def download(url: str, quality: str = "best"):
     if not safe_url(url):
-        raise HTTPException(400, "Link thik chaina")
+        raise HTTPException(400, {"message": "Invalid link."})
     try:
         d = await run_in_threadpool(extract, url)
     except Exception as e:
-        raise HTTPException(400, f"Error: {str(e)[:300]}")
+        fail(e)
     f = pick_format(d, quality)
     if not f:
-        raise HTTPException(404, "Download garne format paiyena")
+        raise HTTPException(404, {"message": "No downloadable format found for this video."})
 
     ext = f.get("ext") or "mp4"
     name = f"{d.get('title') or 'video'}.{ext}"
@@ -92,7 +125,7 @@ async def download(url: str, quality: str = "best"):
     )
     if r.status_code >= 400:
         await r.aclose(); await client.aclose()
-        raise HTTPException(502, "Source site le download roki")
+        raise HTTPException(502, {"message": "The source site blocked the download."})
 
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"}
     if r.headers.get("content-length"):
