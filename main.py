@@ -71,8 +71,8 @@ def extract(url: str):
 def direct(f):
     return f.get("url") and f.get("protocol") in ("http", "https")
 
-def has_v(f): return f.get("vcodec") not in (None, "none")
-def has_a(f): return f.get("acodec") not in (None, "none")
+def has_v(f): return f.get("vcodec") != "none"
+def has_a(f): return f.get("acodec") != "none"
 
 def pick_format(d, quality: str):
     fmts = [f for f in d.get("formats", []) if direct(f)]
