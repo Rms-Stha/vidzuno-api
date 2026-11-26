@@ -1,4 +1,4 @@
-import ipaddress, logging, socket
+import ipaddress, logging, os, socket
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -11,10 +11,16 @@ from starlette.concurrency import run_in_threadpool
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vidzuno")
 
+# Render > Environment ma DEBUG=1 rakhda asli error dekhincha (testing ko lagi)
+DEBUG = os.getenv("DEBUG") == "1"
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://vidzuno.blogspot.com"],  # aafno Blogger URL
+    allow_origins=[
+        "https://vidzuno.blogspot.com",   # <-- yaha aafno asli Blogger URL halnu
+        # "https://www.tapaiko-domain.com",  # custom domain bhaye
+    ],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
@@ -54,8 +60,10 @@ def friendly(err: str) -> str:
 def fail(e: Exception):
     raw = str(e)
     log.warning("extract failed: %s", raw)
-    # "debug" testing ko lagi matra; site live garne bela yo line hataau
-    raise HTTPException(400, {"message": friendly(raw), "debug": raw[:300]})
+    detail = {"message": friendly(raw)}
+    if DEBUG:
+        detail["debug"] = raw[:300]
+    raise HTTPException(400, detail)
 
 def extract(url: str):
     opts = {
@@ -66,7 +74,13 @@ def extract(url: str):
         "retries": 2,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        d = ydl.extract_info(url, download=False)
+    # post ma dherai video bhaye pahilo linchha
+    if d and d.get("entries"):
+        entries = [x for x in d["entries"] if x]
+        if entries:
+            d = entries[0]
+    return d
 
 def direct(f):
     return f.get("url") and f.get("protocol") in ("http", "https")
@@ -115,6 +129,8 @@ async def download(url: str, quality: str = "best"):
     f = pick_format(d, quality)
     if not f:
         raise HTTPException(404, {"message": "No downloadable format found for this video."})
+    if not safe_url(f["url"]):
+        raise HTTPException(400, {"message": "Invalid video source."})
 
     ext = f.get("ext") or "mp4"
     name = f"{d.get('title') or 'video'}.{ext}"
