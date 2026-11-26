@@ -1,213 +1,457 @@
-import ipaddress
-import logging
+
 import os
 import re
+import ipaddress
 import socket
-from urllib.parse import quote, urlparse
+import logging
+import tempfile
+import shutil
+import asyncio
+from pathlib import Path
+from urllib.parse import urlparse
 
-import httpx
 import yt_dlp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
+
+# =====================================================
+# VIDZUNO VIDEO DOWNLOADER API
+# Blogger Frontend + Render Backend
+# =====================================================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vidzuno")
 
-# Render > Environment ma DEBUG=1 rakhda asli error dekhincha (testing ko lagi)
-DEBUG = os.getenv("DEBUG") == "1"
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://vidzuno.blogspot.com",
-        "http://vidzuno.blogspot.com",
-    ],
-    allow_origin_regex=r"https://vidzuno\.blogspot\.[a-z.]+",
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "1500"))
+MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+# =====================================================
+# FASTAPI APP
+# =====================================================
+
+app = FastAPI(
+    title="Vidzuno API",
+    description="Vidzuno Video Downloader",
+    version="2.0.0"
 )
 
+origins = [
+    "https://vidzuno.blogspot.com",
+    "http://vidzuno.blogspot.com"
+]
 
-def safe_url(u: str) -> bool:
-    """Blocks localhost / private IP links (server security)"""
-    p = urlparse(u)
-    if p.scheme not in ("http", "https") or not p.hostname:
-        return False
+custom_domain = os.getenv("CUSTOM_ORIGIN")
+if custom_domain:
+    origins.append(custom_domain.rstrip("/"))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"]
+)
+
+# =====================================================
+# SECURITY
+# =====================================================
+
+def safe_url(url):
     try:
-        for i in socket.getaddrinfo(p.hostname, None):
-            ip = ipaddress.ip_address(i[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        p = urlparse(url)
+
+        if p.scheme not in ("http", "https"):
+            return False
+
+        if not p.hostname:
+            return False
+
+        if p.username or p.password:
+            return False
+
+        if p.port not in (None, 80, 443):
+            return False
+
+        host = p.hostname.rstrip(".").lower()
+
+        if host == "localhost" or host.endswith(".local"):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_global
+        except ValueError:
+            pass
+
+        results = socket.getaddrinfo(
+            host,
+            p.port or (443 if p.scheme == "https" else 80),
+            type=socket.SOCK_STREAM
+        )
+
+        if not results:
+            return False
+
+        for result in results:
+            ip = ipaddress.ip_address(result[4][0])
+            if not ip.is_global:
                 return False
+
+        return True
+
     except Exception:
         return False
-    return True
 
 
-def clean_filename(title: str, ext: str) -> str:
-    """Removes invalid filename characters safely"""
-    base = re.sub(r'[\\/*?:"<>|\r\n]+', "_", (title or "video")).strip()
-    base = base[:120] or "video"
-    return f"{base}.{ext}"
+def validate_url(url):
+    if not safe_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Invalid or unsafe video URL."}
+        )
 
 
-def friendly(err: str) -> str:
-    e = err.lower()
-    if "not a bot" in e:
-        return "The source site blocked our server (bot check). Please try again later or use another link."
-    if "drm" in e:
-        return "This video is DRM-protected and cannot be downloaded."
+# =====================================================
+# FILENAME CLEANER
+# =====================================================
+
+def clean_filename(title, ext):
+    title = re.sub(
+        r'[\\/*?:"<>|\r\n]+',
+        "_",
+        title or "video"
+    )
+
+    title = title.strip(" ._")[:120] or "video"
+    ext = re.sub(r"[^a-zA-Z0-9]", "", ext or "mp4")
+
+    return f"{title}.{ext}"
+
+
+# =====================================================
+# ERROR HANDLER
+# =====================================================
+
+def friendly_error(error):
+    e = str(error).lower()
+
     if "unsupported url" in e:
-        return "This website is not supported yet."
-    if any(k in e for k in ("private", "login", "log in", "sign in", "members", "age-restricted", "cookies")):
-        return "This video is private or requires login."
-    if any(k in e for k in ("country", "geo", "region")):
-        return "This video is not available in our server's region."
-    if any(k in e for k in ("404", "not found", "removed", "unavailable", "does not exist")):
-        return "Video not found or it has been removed."
-    if any(k in e for k in ("429", "403", "forbidden", "too many requests")):
-        return "The source site blocked the request. Please try again later."
-    return "Could not fetch this video. Please check the link and try again."
+        return "This website is not supported."
+
+    if "drm" in e:
+        return "This video is DRM protected."
+
+    if "not a bot" in e:
+        return "The source website blocked our server."
+
+    if any(x in e for x in (
+        "private video", "login required",
+        "sign in", "members only", "age-restricted"
+    )):
+        return "This video requires login or permission."
+
+    if any(x in e for x in (
+        "geo restricted", "country", "region"
+    )):
+        return "This video is unavailable in our region."
+
+    if any(x in e for x in (
+        "404", "not found", "removed", "unavailable"
+    )):
+        return "Video not found or removed."
+
+    if any(x in e for x in (
+        "429", "403", "forbidden", "too many requests"
+    )):
+        return "The source website blocked the request."
+
+    return "Unable to process this video. Please try another link."
 
 
-def fail(e: Exception):
-    raw = str(e)
-    log.warning("extract failed: %s", raw)
-    detail = {"message": friendly(raw)}
+def fail(error):
+    log.exception("Vidzuno error: %s", error)
+
+    detail = {
+        "message": friendly_error(error)
+    }
+
     if DEBUG:
-        detail["debug"] = raw[:300]
+        detail["debug"] = str(error)[:300]
+
     raise HTTPException(400, detail)
 
 
-def extract(url: str):
-    opts = {
+# =====================================================
+# YT-DLP OPTIONS
+# =====================================================
+
+def base_options():
+    return {
         "quiet": True,
+        "no_warnings": True,
         "noplaylist": True,
-        "skip_download": True,
         "socket_timeout": 20,
         "retries": 2,
+        "fragment_retries": 2,
+        "max_filesize": MAX_DOWNLOAD_BYTES,
+        "ignoreerrors": False
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        d = ydl.extract_info(url, download=False)
-    if d and d.get("entries"):
-        entries = [x for x in d["entries"] if x]
-        if entries:
-            d = entries[0]
-    return d
 
 
-def direct(f):
-    return f.get("url") and f.get("protocol") in ("http", "https")
+# =====================================================
+# VIDEO EXTRACTION
+# =====================================================
+
+def extract_video(url):
+    options = base_options()
+    options["skip_download"] = True
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        data = ydl.extract_info(url, download=False)
+
+    if not data:
+        raise ValueError("Video information not found.")
+
+    if data.get("entries"):
+        entries = [x for x in data["entries"] if x]
+
+        if not entries:
+            raise ValueError("No video found.")
+
+        data = entries[0]
+
+    return data
 
 
-def has_v(f):
-    return f.get("vcodec") not in (None, "none")
+# =====================================================
+# AVAILABLE VIDEO QUALITIES
+# =====================================================
+
+def get_qualities(data):
+    qualities = set()
+
+    for f in data.get("formats", []):
+        height = f.get("height")
+
+        if (
+            height
+            and f.get("vcodec") not in (None, "none")
+        ):
+            qualities.add(int(height))
+
+    return sorted(qualities)
 
 
-def has_a(f):
-    return f.get("acodec") not in (None, "none")
+# =====================================================
+# FORMAT SELECTOR
+# =====================================================
+
+ALLOWED_QUALITIES = {
+    "360", "480", "720", "1080",
+    "1440", "2160", "best", "mp3"
+}
 
 
-def pick_format(d, quality: str):
-    fmts = [f for f in d.get("formats", []) if direct(f)]
+def select_format(quality):
+    if quality == "mp3":
+        return "bestaudio/best"
 
-    # Audio-only option
-    if quality in ("mp3", "audio"):
-        aud = [f for f in fmts if has_a(f) and not has_v(f)]
-        aud.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0)
-        if aud:
-            return aud[-1]
-        # Audio-only stream nabhaye video+audio stream fallback
-        both = [f for f in fmts if has_a(f)]
-        both.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0)
-        return both[-1] if both else None
+    if quality == "best":
+        return "bestvideo+bestaudio/best"
 
-    # Video + Audio (progressive/muxed)
-    vids = [f for f in fmts if has_v(f) and has_a(f)]
-    vids.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
-    if not vids:
-        return None
+    height = int(quality)
 
-    want = int(quality) if quality.isdigit() else 0
-    exact = [f for f in vids if f.get("height") == want]
-    if exact:
-        return exact[-1]
+    return (
+        f"bestvideo[height<={height}]"
+        f"+bestaudio/"
+        f"best[height<={height}]/"
+        f"bestvideo+bestaudio/best"
+    )
 
-    # Exact quality nabhaye nजिकको (equal or lower) quality dincha
-    lower = [f for f in vids if (f.get("height") or 0) <= want] if want else []
-    return lower[-1] if lower else vids[-1]
 
+# =====================================================
+# DOWNLOAD PROCESSOR
+# =====================================================
+
+def process_download(url, quality, folder):
+    template = os.path.join(
+        folder,
+        "%(title).150B-%(id)s.%(ext)s"
+    )
+
+    options = base_options()
+
+    options.update({
+        "format": select_format(quality),
+        "outtmpl": template,
+        "overwrites": True,
+        "continuedl": True,
+        "merge_output_format": "mp4"
+    })
+
+    if quality == "mp3":
+        options["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192"
+        }]
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        data = ydl.extract_info(url, download=True)
+
+    if not data:
+        raise ValueError("Download failed.")
+
+    if data.get("entries"):
+        entries = [x for x in data["entries"] if x]
+        if not entries:
+            raise ValueError("No video downloaded.")
+        data = entries[0]
+
+    allowed = {
+        ".mp4", ".mkv", ".webm", ".mov",
+        ".m4v", ".mp3", ".m4a", ".opus",
+        ".ogg", ".wav", ".flac"
+    }
+
+    files = [
+        p for p in Path(folder).iterdir()
+        if p.is_file()
+        and p.suffix.lower() in allowed
+        and p.stat().st_size > 0
+    ]
+
+    if not files:
+        raise ValueError("Output file not found.")
+
+    output = max(
+        files,
+        key=lambda p: p.stat().st_size
+    )
+
+    if output.stat().st_size > MAX_DOWNLOAD_BYTES:
+        raise ValueError("Download exceeds maximum size.")
+
+    return output, data
+
+
+# =====================================================
+# HEALTH CHECK
+# =====================================================
 
 @app.get("/")
-def health():
-    return {"ok": True}
-
-
-@app.get("/api/info")
-def info(url: str):
-    if not safe_url(url):
-        raise HTTPException(400, {"message": "Invalid link."})
-    try:
-        d = extract(url)
-    except Exception as e:
-        fail(e)
-
-    heights = sorted({
-        f["height"]
-        for f in d.get("formats", [])
-        if direct(f) and has_v(f) and has_a(f) and f.get("height")
-    })
+def home():
     return {
-        "title": d.get("title"),
-        "thumbnail": d.get("thumbnail"),
-        "heights": heights,
+        "ok": True,
+        "name": "Vidzuno API",
+        "version": "2.0.0",
+        "status": "online"
     }
 
 
-@app.get("/api/download")
-async def download(url: str, quality: str = "best"):
-    if not safe_url(url):
-        raise HTTPException(400, {"message": "Invalid link."})
+@app.get("/health")
+def health():
+    return {"status": "online"}
+
+
+# =====================================================
+# VIDEO INFORMATION API
+# =====================================================
+
+@app.get("/api/info")
+async def video_info(
+    url: str = Query(..., max_length=2048)
+):
+    validate_url(url)
+
     try:
-        d = await run_in_threadpool(extract, url)
+        data = await run_in_threadpool(
+            extract_video,
+            url
+        )
+
+        qualities = get_qualities(data)
+
+        return {
+            "success": True,
+            "title": data.get("title") or "Unknown Video",
+            "thumbnail": data.get("thumbnail"),
+            "duration": data.get("duration"),
+            "uploader": data.get("uploader"),
+            "qualities": qualities,
+            "heights": qualities,
+            "formats": ["mp4", "mp3"]
+        }
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         fail(e)
 
-    f = pick_format(d, quality)
-    if not f:
-        raise HTTPException(404, {"message": "No downloadable format found for this video."})
-    if not safe_url(f["url"]):
-        raise HTTPException(400, {"message": "Invalid video source."})
 
-    ext = f.get("ext") or "mp4"
-    name = clean_filename(d.get("title"), ext)
+# =====================================================
+# VIDEO / MP3 DOWNLOAD API
+# =====================================================
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=None)
-    r = await client.send(
-        client.build_request("GET", f["url"], headers=f.get("http_headers") or {}),
-        stream=True,
-    )
-    if r.status_code >= 400:
-        await r.aclose()
-        await client.aclose()
-        raise HTTPException(502, {"message": "The source site blocked the download."})
+@app.get("/api/download")
+async def download(
+    url: str = Query(..., max_length=2048),
+    quality: str = Query("best")
+):
+    validate_url(url)
 
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"}
-    if r.headers.get("content-length"):
-        headers["Content-Length"] = r.headers["content-length"]
+    quality = quality.lower().strip()
 
-    async def gen():
-        try:
-            async for chunk in r.aiter_bytes(65536):
-                yield chunk
-        finally:
-            await r.aclose()
-            await client.aclose()
+    if quality not in ALLOWED_QUALITIES:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Unsupported quality."}
+        )
 
-    return StreamingResponse(
-        gen(),
-        media_type=r.headers.get("content-type", "application/octet-stream"),
-        headers=headers,
-    )
+    folder = tempfile.mkdtemp(prefix="vidzuno_")
+
+    try:
+        async with semaphore:
+            output, data = await run_in_threadpool(
+                process_download,
+                url,
+                quality,
+                folder
+            )
+
+        filename = clean_filename(
+            data.get("title") or "video",
+            output.suffix.lstrip(".")
+        )
+
+        return FileResponse(
+            path=str(output),
+            filename=filename,
+            media_type="application/octet-stream",
+            background=BackgroundTask(
+                shutil.rmtree,
+                folder,
+                ignore_errors=True
+            )
+        )
+
+    except HTTPException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+    except Exception as e:
+        shutil.rmtree(folder, ignore_errors=True)
+        fail(e)
+
+
+# =====================================================
+# END OF VIDZUNO API
+# =====================================================
